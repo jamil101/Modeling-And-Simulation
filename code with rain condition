@@ -1,0 +1,580 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <DHT.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// ----------- PIN DEFINITIONS -----------
+#define DHTPIN 13
+#define DHTTYPE DHT22
+#define SOIL_PIN 34
+#define LDR_PIN 35
+#define RAIN_PIN 32
+#define WATER_LEVEL_PIN 33
+#define PUMP_RELAY 16
+#define FAN1_RELAY 26 // Fan 1 - 22°C
+#define FAN2_RELAY 27 // Fan 2 - 24°C
+#define MANUAL_BUTTON 4
+#define WIFI_STATUS_LED 2
+
+// ----------- PROJECT INFO -----------
+#define PROJECT_NAME "SmartFarm"
+#define VERSION "v3.2"
+
+// ----------- THRESHOLDS -----------
+#define TEMP_FAN1_ON 22
+#define TEMP_FAN1_OFF 18
+#define TEMP_FAN2_ON 24
+#define TEMP_FAN2_OFF 20
+#define TEMP_CRITICAL 35
+
+// Water level thresholds for pump control
+#define WATER_PUMP_ON 1200 // Turn pump ON when water level > this (high water)
+#define WATER_PUMP_OFF 600 // Turn pump OFF when water level < this (low water)
+#define WATER_CRITICAL 400 // Critical water level - emergency stop
+#define RAIN_THRESHOLD 800 // Rain detection threshold (display only)
+
+#define SOIL_DRY 2500
+#define SOIL_WET 1800
+
+// ----------- THINGSPEAK -----------
+#define THINGSPEAK_WRITE_KEY "NC47N46ACJUARDCK"
+const char *server = "http://api.thingspeak.com/update";
+const char *ssid = "Kuet21";
+const char *password = "89777145!!";
+
+// ----------- TIMING -----------
+#define UPLOAD_INTERVAL 30000 // 30 seconds (ThingSpeak minimum is 15s)
+#define SENSOR_READ_INTERVAL 2000
+#define LCD_UPDATE_INTERVAL 2000
+
+// ----------- OBJECTS -----------
+DHT dht(DHTPIN, DHTTYPE);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ----------- VARIABLES -----------
+unsigned long lastUpload = 0;
+unsigned long lastSensorRead = 0;
+unsigned long lastLCDUpdate = 0;
+unsigned long pumpStartTime = 0;
+
+float temperature = 0;
+float humidity = 0;
+int soilMoisture = 0;
+int lightLevel = 0;
+int rainLevel = 0;
+int waterLevel = 0;
+
+bool pumpStatus = false;
+bool fan1Status = false;
+bool fan2Status = false;
+bool manualMode = false;
+bool manualPumpRequest = false;
+bool isRaining = false;
+
+int lcdScreen = 0;
+const int TOTAL_SCREENS = 6;
+
+// ----------- GET CURRENT TIME (uptime) -----------
+String getTimeString()
+{
+  unsigned long seconds = millis() / 1000;
+  int hours = (seconds / 3600) % 24;
+  int minutes = (seconds / 60) % 60;
+  int secs = seconds % 60;
+
+  char timeStr[9];
+  sprintf(timeStr, "%02d:%02d:%02d", hours, minutes, secs);
+  return String(timeStr);
+}
+
+// ----------- CHECK RAIN STATUS (display only) -----------
+void updateRainStatus()
+{
+  bool currentlyRaining = (rainLevel > RAIN_THRESHOLD);
+  if (currentlyRaining != isRaining)
+  {
+    isRaining = currentlyRaining;
+    if (isRaining)
+      Serial.println("☔ RAIN DETECTED! (Display only)");
+    else
+      Serial.println("☀️ Rain stopped. (Display only)");
+  }
+}
+
+String getPlantGrowthStatus()
+{
+  bool soilGood = soilMoisture < 2200; // lower = wet
+  bool lightGood = lightLevel > 1500;  // higher = bright
+
+  if (soilGood && lightGood)
+    return "GOOD";
+  if (!soilGood && !lightGood)
+    return "CRITICAL";
+  if (!soilGood)
+    return "NEED WATER";
+  if (!lightGood)
+    return "NEED LIGHT";
+  return "CHECK";
+}
+
+// ----------- SETUP -----------
+void setup()
+{
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println("Smart Farming System Starting...");
+
+  // Initialize I2C and LCD
+  Wire.begin();
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print(PROJECT_NAME);
+  lcd.print(" ");
+  lcd.print(VERSION);
+  lcd.setCursor(0, 1);
+  lcd.print("Initializing...");
+  delay(2000);
+
+  // Initialize components
+  dht.begin();
+
+  pinMode(PUMP_RELAY, OUTPUT);
+  pinMode(FAN1_RELAY, OUTPUT);
+  pinMode(FAN2_RELAY, OUTPUT);
+  pinMode(MANUAL_BUTTON, INPUT_PULLUP);
+  pinMode(WIFI_STATUS_LED, OUTPUT);
+
+  // Turn off all relays (active LOW)
+  digitalWrite(PUMP_RELAY, HIGH);
+  digitalWrite(FAN1_RELAY, HIGH);
+  digitalWrite(FAN2_RELAY, HIGH);
+  digitalWrite(WIFI_STATUS_LED, LOW);
+
+  // Connect WiFi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(PROJECT_NAME);
+  lcd.print(" ");
+  lcd.print(VERSION);
+  lcd.setCursor(0, 1);
+  lcd.print("WiFi Connecting");
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20)
+  {
+    Serial.print(".");
+    lcd.setCursor(attempts % 16, 1);
+    lcd.print(".");
+    delay(500);
+    attempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    Serial.println("\nWiFi Connected!");
+    digitalWrite(WIFI_STATUS_LED, HIGH);
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print(PROJECT_NAME);
+    lcd.print(" ");
+    lcd.print(VERSION);
+    lcd.setCursor(0, 1);
+    lcd.print("WiFi OK");
+    delay(1500);
+  }
+  else
+  {
+    Serial.println("\nWiFi Failed!");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print(PROJECT_NAME);
+    lcd.print(" ");
+    lcd.print(VERSION);
+    lcd.setCursor(0, 1);
+    lcd.print("WiFi Failed");
+    delay(1500);
+  }
+
+  lcd.clear();
+  Serial.println("System Ready!");
+  Serial.println("Pump control mode: Based on WATER LEVEL only");
+  Serial.print("Pump ON when water level > ");
+  Serial.println(WATER_PUMP_ON);
+  Serial.print("Pump OFF when water level < ");
+  Serial.println(WATER_PUMP_OFF);
+}
+
+// ----------- READ SENSORS -----------
+void readSensors()
+{
+  // Read analog sensors first
+  soilMoisture = analogRead(SOIL_PIN);
+  lightLevel = analogRead(LDR_PIN);
+  rainLevel = analogRead(RAIN_PIN);
+  waterLevel = analogRead(WATER_LEVEL_PIN);
+
+  // Then read DHT (which takes some time)
+  float newTemp = dht.readTemperature();
+  float newHum = dht.readHumidity();
+
+  if (!isnan(newTemp))
+    temperature = newTemp;
+  if (!isnan(newHum))
+    humidity = newHum;
+
+  updateRainStatus();
+}
+
+// ----------- CONTROL ACTUATORS -----------
+void controlActuators()
+{
+  // === EMERGENCY SAFETY (applies to all modes) ===
+  if (waterLevel < WATER_CRITICAL && pumpStatus)
+  {
+    pumpStatus = false;
+    digitalWrite(PUMP_RELAY, HIGH);
+    Serial.println("🚨 EMERGENCY: Pump OFF - Water CRITICAL!");
+  }
+
+  // === PUMP CONTROL ===
+  if (!manualMode)
+  {
+    // Auto mode: based on water level only
+    if (waterLevel > WATER_PUMP_ON && !pumpStatus)
+    {
+      pumpStatus = true;
+      pumpStartTime = millis();
+      Serial.print("💧 Pump ON - Water level HIGH (");
+      Serial.print(waterLevel);
+      Serial.print(" > ");
+      Serial.print(WATER_PUMP_ON);
+      Serial.println(")");
+    }
+    else if (waterLevel < WATER_PUMP_OFF && pumpStatus)
+    {
+      pumpStatus = false;
+      Serial.print("💧 Pump OFF - Water level LOW (");
+      Serial.print(waterLevel);
+      Serial.print(" < ");
+      Serial.print(WATER_PUMP_OFF);
+      Serial.println(")");
+    }
+
+    // Pump runtime protection (max 30 minutes)
+    if (pumpStatus && (millis() - pumpStartTime > 1800000))
+    {
+      pumpStatus = false;
+      Serial.println("⚠️ Pump timeout - Auto OFF after 30min");
+    }
+  }
+  else
+  {
+    // Manual mode: follow manualPumpRequest
+    bool newPumpState = manualPumpRequest;
+    if (newPumpState != pumpStatus)
+    {
+      pumpStatus = newPumpState;
+      pumpStartTime = millis(); // reset timer when manual changes
+      Serial.print("🔧 Manual pump ");
+      Serial.println(pumpStatus ? "ON" : "OFF");
+    }
+  }
+
+  // Apply pump state (active LOW)
+  digitalWrite(PUMP_RELAY, pumpStatus ? LOW : HIGH);
+
+  // === FAN 1 CONTROL (with hysteresis) ===
+  bool newFan1 = fan1Status;
+  if (temperature > TEMP_FAN1_ON)
+    newFan1 = true;
+  else if (temperature < TEMP_FAN1_OFF)
+    newFan1 = false;
+
+  if (newFan1 != fan1Status)
+  {
+    fan1Status = newFan1;
+    digitalWrite(FAN1_RELAY, fan1Status ? LOW : HIGH);
+    Serial.print("🌀 Fan1: ");
+    Serial.println(fan1Status ? "ON" : "OFF");
+  }
+
+  // === FAN 2 CONTROL (with hysteresis) ===
+  bool newFan2 = fan2Status;
+  if (temperature > TEMP_FAN2_ON)
+    newFan2 = true;
+  else if (temperature < TEMP_FAN2_OFF)
+    newFan2 = false;
+
+  if (newFan2 != fan2Status)
+  {
+    fan2Status = newFan2;
+    digitalWrite(FAN2_RELAY, fan2Status ? LOW : HIGH);
+    Serial.print("🌀🌀 Fan2: ");
+    Serial.println(fan2Status ? "ON" : "OFF");
+  }
+
+  // Critical temperature override - both fans ON
+  if (temperature > TEMP_CRITICAL)
+  {
+    if (!fan1Status)
+    {
+      fan1Status = true;
+      digitalWrite(FAN1_RELAY, LOW);
+      Serial.println("🌡️ CRITICAL TEMP - Fan1 forced ON");
+    }
+    if (!fan2Status)
+    {
+      fan2Status = true;
+      digitalWrite(FAN2_RELAY, LOW);
+      Serial.println("🌡️ CRITICAL TEMP - Fan2 forced ON");
+    }
+  }
+}
+
+// ----------- CHECK BUTTON (non-blocking) -----------
+void checkButton()
+{
+  static unsigned long pressStart = 0;
+  static bool buttonWasPressed = false;
+  static bool longPressHandled = false;
+
+  bool buttonIsPressed = (digitalRead(MANUAL_BUTTON) == LOW);
+
+  // Button just pressed
+  if (buttonIsPressed && !buttonWasPressed)
+  {
+    pressStart = millis();
+    longPressHandled = false;
+    buttonWasPressed = true;
+  }
+  // Button just released
+  else if (!buttonIsPressed && buttonWasPressed)
+  {
+    unsigned long pressDuration = millis() - pressStart;
+    if (pressDuration < 2000 && !longPressHandled)
+    {
+      // Short press: toggle manual mode
+      manualMode = !manualMode;
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print(PROJECT_NAME);
+      lcd.print(" ");
+      lcd.print(VERSION);
+      lcd.setCursor(0, 1);
+      lcd.print("Mode: ");
+      lcd.print(manualMode ? "MANUAL" : "AUTO");
+      delay(1000);
+      lcd.clear();
+    }
+    buttonWasPressed = false;
+  }
+
+  // Long press detection (only in manual mode, not yet handled)
+  if (manualMode && buttonIsPressed && !longPressHandled && (millis() - pressStart >= 2000))
+  {
+    longPressHandled = true;
+    manualPumpRequest = !manualPumpRequest;
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print(PROJECT_NAME);
+    lcd.print(" ");
+    lcd.print(VERSION);
+    lcd.setCursor(0, 1);
+    lcd.print("Manual Pump ");
+    lcd.print(manualPumpRequest ? "ON" : "OFF");
+    delay(1000);
+    lcd.clear();
+  }
+}
+
+// ----------- UPDATE LCD -----------
+void updateLCD()
+{
+  if (millis() - lastLCDUpdate < LCD_UPDATE_INTERVAL)
+    return;
+  lastLCDUpdate = millis();
+
+  lcdScreen = (lcdScreen + 1) % TOTAL_SCREENS;
+  lcd.clear();
+
+  switch (lcdScreen)
+  {
+  case 0:
+    lcd.setCursor(0, 0);
+    lcd.print(PROJECT_NAME);
+    lcd.print(" ");
+    lcd.print(VERSION);
+    lcd.setCursor(0, 1);
+    lcd.print("Uptime: ");
+    lcd.print(getTimeString());
+    break;
+
+  case 1:
+    lcd.setCursor(0, 0);
+    lcd.print("Temperature:");
+    lcd.setCursor(0, 1);
+    lcd.print(temperature, 1);
+    lcd.print("C ");
+    lcd.print(getTimeString());
+    break;
+
+  case 2:
+    lcd.setCursor(0, 0);
+    lcd.print("Humidity:");
+    lcd.setCursor(0, 1);
+    lcd.print(humidity, 1);
+    lcd.print("%");
+    break;
+
+  case 3:
+    lcd.setCursor(0, 0);
+    lcd.print("Water Level:");
+    lcd.setCursor(0, 1);
+    lcd.print(waterLevel);
+    lcd.print(" (");
+    if (waterLevel > WATER_PUMP_ON)
+      lcd.print("HIGH");
+    else if (waterLevel < WATER_PUMP_OFF)
+      lcd.print("LOW");
+    else
+      lcd.print("MID");
+    lcd.print(")");
+    break;
+
+  case 4:
+    lcd.setCursor(0, 0);
+    lcd.print("Soil:");
+    lcd.print(soilMoisture);
+    lcd.print(" Rain:");
+    if (rainLevel < 500)
+      lcd.print("D");
+    else if (rainLevel < 1500)
+      lcd.print("L");
+    else
+      lcd.print("H");
+    lcd.setCursor(0, 1);
+    lcd.print("P:");
+    lcd.print(pumpStatus ? "ON " : "OFF");
+    lcd.print("F1:");
+    lcd.print(fan1Status ? "ON " : "OFF");
+    lcd.print("F2:");
+    lcd.print(fan2Status ? "ON" : "OFF");
+    lcd.print(" M:");
+    lcd.print(manualMode ? "M" : "A");
+    break;
+
+  case 5:
+    lcd.setCursor(0, 0);
+    lcd.print("Plant Status:");
+    lcd.setCursor(0, 1);
+    lcd.print(getPlantGrowthStatus());
+    break;
+  }
+}
+
+// ----------- SERIAL OUTPUT -----------
+void printData()
+{
+  Serial.println("\n=== " + String(PROJECT_NAME) + " " + String(VERSION) + " ===");
+  Serial.print("Uptime: ");
+  Serial.println(getTimeString());
+  Serial.print("Temperature: ");
+  Serial.print(temperature);
+  Serial.println(" C");
+  Serial.print("Humidity: ");
+  Serial.print(humidity);
+  Serial.println(" %");
+  Serial.print("Soil Moisture: ");
+  Serial.println(soilMoisture);
+  Serial.print("Water Level: ");
+  Serial.print(waterLevel);
+  Serial.print(" (ON>");
+  Serial.print(WATER_PUMP_ON);
+  Serial.print(" OFF<");
+  Serial.print(WATER_PUMP_OFF);
+  Serial.print(" CRIT<");
+  Serial.print(WATER_CRITICAL);
+  Serial.println(")");
+  Serial.print("Rain Level: ");
+  Serial.print(rainLevel);
+  Serial.print(" - ");
+  Serial.println(isRaining ? "RAINING ☔" : "NOT RAINING ☀️");
+  Serial.print("Light Level: ");
+  Serial.println(lightLevel);
+  Serial.print("Pump: ");
+  Serial.println(pumpStatus ? "ON" : "OFF");
+  Serial.print("Fan1: ");
+  Serial.println(fan1Status ? "ON" : "OFF");
+  Serial.print("Fan2: ");
+  Serial.println(fan2Status ? "ON" : "OFF");
+  Serial.print("Mode: ");
+  Serial.println(manualMode ? "MANUAL" : "AUTO");
+  Serial.print("WiFi: ");
+  Serial.println(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected");
+  Serial.println("================================");
+}
+
+// ----------- SEND TO THINGSPEAK -----------
+void sendToThingSpeak()
+{
+  if (WiFi.status() != WL_CONNECTED)
+    return;
+
+  HTTPClient http;
+  http.setTimeout(5000);
+
+  String url = String(server) +
+               "?api_key=" + THINGSPEAK_WRITE_KEY +
+               "&field1=" + String(temperature) +
+               "&field2=" + String(humidity) +
+               "&field3=" + String(soilMoisture) +
+               "&field4=" + String(lightLevel) +
+               "&field5=" + String(rainLevel) +
+               "&field6=" + String(waterLevel) +
+               "&field7=" + String(pumpStatus ? 1 : 0) +
+               "&field8=" + String(isRaining ? 1 : 0);
+
+  http.begin(url);
+  int httpCode = http.GET();
+
+  if (httpCode == 200)
+  {
+    Serial.println("✓ Data sent to ThingSpeak");
+  }
+  else
+  {
+    Serial.println("✗ ThingSpeak upload failed");
+  }
+
+  http.end();
+}
+
+// ----------- LOOP -----------
+void loop()
+{
+  if (millis() - lastSensorRead > SENSOR_READ_INTERVAL)
+  {
+    lastSensorRead = millis();
+    readSensors();
+    checkButton();
+    controlActuators();
+    printData();
+  }
+
+  updateLCD();
+
+  if (millis() - lastUpload > UPLOAD_INTERVAL)
+  {
+    lastUpload = millis();
+    sendToThingSpeak();
+  }
+
+  delay(50);
+}
